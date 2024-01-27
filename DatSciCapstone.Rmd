@@ -1,0 +1,680 @@
+---
+title: "Data Science Capstone: Metabolies in Health and Disease"
+format: pdf
+editor: visual
+author: Melba Torres
+execute: 
+  error: false
+  warning: false
+---
+
+## Metabolites in Health and Disease
+
+### Introduction
+
+Metabolomics, the study of small molecules, offers a high-resolution window into an organism's phenotype. By measuring the presence and abundance of metabolites, we can gain quantitative insights into its physiological state. The data used for this project was produced by Casaro et al. their data was published along the study titled "Blood metabolomics and impacted cellular mechanisms during transition into lactation in dairy cows that develop metritis"¹. This data can be found at the Metabolomics Workbench website under study ID ST002556.
+
+#### Experimental Approach Summary
+
+To investigate the metabolic changes associated with Metritis in Holstein dairy cows, Casaro et al. collected blood samples at three time points: prepartum (14 ± 6 days before calving), calving, and diagnosis (7 ± 2 days after calving). This dataset includes a total of 103 cows, 52 of which exhibited clinical signs of Metritis and thus were identified as "Met" as opposed to "Con" (Control). Metritis is a poly-microbial infection characterized by the presence of a reddish-brown, fetid discharge; Unlike other infections, recent research has shown that Metritis can be primarily attributed to shifts in the uterine microbiome rather the presence of specific pathogens². The researchers analyzed these blood samples using untargeted gas chromatography time-of-flight mass spectrometry to obtain metabolic profiles.
+
+#### Data Analysis Approach Summary
+
+For this project, I decided to focus on "Calving", as this is the closest time point to diagnosis and the instance preceding metritis manifestations. This is also the time point that does not have a range, thus, measurements might be more comparable than for the pre-partum period which has a range of 8-20 days, which might lead to cows samples at day 8 to differ from cows samples at day 20, even though they were grouped together based on time point and diagnosis.
+
+#### Data and Approach Limitations
+
+Metabolic profiles are made up of multiple variables that are, by the nature of metabolism, at least somewhat correlated, if not strongly. Untargeted gas chromatography time-of-flight mass spectrometry is a high-granularity approach, but it does have limitations, including a bias towards identifying more volatile compounds and incorrect identification of metabolites during downstream analysis of peaks.
+
+It is also unlikely that all cows calved at the same time. According to the paper, samples were collected within a 24-hour range of calving. This range and the discrepancies in calving times could be large enough to introduce bias by adding time- and space-related noise to the data.
+
+Additionally, as mentioned above, metritis is polybacterial and related to the microbiome. It is possible that multiple scenarios could lead to metritis and that cows are responding to specific microbiome products, leading to more variability in response.\
+\
+Finally, just like people, each cow is different 🐮❤️. Their behavior and personality could also be a source of noise. For example, a skittish cow might have a higher level of stress-related metabolites that are not related to infection compared to a more trusting cow. Collecting multiple samples at previous time points that allow for a "baseline" metabolic reading would be more appropriate.
+
+**Workflow Overview:**
+
+-   Data Wrangling: Restructure data for statistical analysis and model fitting.
+
+-   Data transformation and scaling for for statistical analysis and model fitting.
+
+-   Group Differentiation Assessment or "is this even worth the time" test:\
+    Employ PERMANOVA to determine statistical differences between "Met" (metritis) and "Con" (control) groups.
+
+-   Metabolite Importance Identification:\
+    Utilize diverse approaches to pinpoint key metabolites:
+
+    -   Partial Least Squares Discriminant Analysis (PLS-DA)
+    -   Generalized Linear Model with Least Absolute Shrinkage and Selection Operator (GLM-LASSO)
+    -   Uni-variate analysis with t-tests
+
+-   Log-Fold Change Calculation:\
+    Quantify magnitude of change for identified important metabolites
+
+## Setup
+
+```{r, message = FALSE, warning = FALSE}
+pacman::p_load(tidyverse, performance, ggpubr, ggplot2, janitor, visdat, skimr, caret, reshape2, glmnet, nestedcv, reshape2, ggfortify, mdatools, dplyr, ggvegan, vegan, corrr, ggcorrplot, mdatools, nestedcv)
+
+fav_colors <- c("#e60200", "#e96000","#e94196","#ed5c9b","cornflowerblue", "#00cdff", "forestgreen","#3aaf85", "#9DC183")
+
+theme_set(theme_linedraw())
+```
+
+## Data Wrangling and Exploration
+
+The raw data file contains metabolite abundance measurements for 103 Holstein cows at the three previously mentioned time points. Each cow has a unique ID for identification. A total of 265 metabolites are included. Additionally, the dataset includes information on cow parity (primiparous or multiparous).
+
+The data is organized so that each column represent a cow, with rows being either "factors" or metabolites.
+
+```{r, echo=FALSE}
+Raw_data <- read_csv("https://docs.google.com/spreadsheets/d/e/2PACX-1vSGQ3ezyJwWItEr8E8Pj8jN0gK_LutC3SWRKItP-lLNKs2liSgzrQjvCVPr0GMTWrF-F8uki4kgXAdS/pub?output=csv", col_names = F, show_col_types = F)
+```
+
+```{r, echo=FALSE}
+# Create a copy of raw data and lighly modify it to be more interpretabl
+Raw_mod <- Raw_data
+colnames(Raw_mod) <- Raw_data[1,]
+Raw_mod <- Raw_mod[-1,]
+
+# Save a copy of the raw data for further wrangling
+df <- Raw_data
+```
+
+Below are the first 6 rows and 10 columns of the raw data (with some modification for interpretability)
+
+```{r}
+Raw_mod[1:6,1:10]
+```
+
+During data wrangling, I restructured the data into an analysis-friendly version, where each row corresponds to a unique sample. Below is the annotated code.
+
+```{r}
+# Since all the metabolite names begin with a number, add a prefix to metabolite names ("M_") to avoid errors due to invalid names. Additionally, replaced spaces and "-" with "_".
+df_names <- paste("M",sep="_", 
+                df$X1[3:length(df$X1)])|>
+  str_replace_all("-", "_") |>
+  str_replace_all(" ","_")
+
+# Transpose dataframe to have individuals as rows
+tdf <- t(df) |>
+  data.frame()
+
+# Change column names
+colnames(tdf) <- c("CowNumber", "Factor", df_names)
+
+# Remove first row (names)  
+tdf <- tibble(tdf[-1,])
+
+# Separate the items inside the column "Factors"
+tdf <- separate_wider_delim(tdf, Factor, delim = " | ", names = c("Diagnosis", "Time", "Parity"))
+
+# Clean up the data for the first 4 columns, rename "Group" to "Diagnosis"
+tdf <- tdf %>%
+  mutate(Diagnosis = str_remove_all(Diagnosis, "Group:"),
+         Time = str_remove_all(Time, "Time:"),
+         Parity= str_remove_all(Parity, "Parity:"),
+         # Leave only the cow number
+         CowNumber = str_remove_all(CowNumber, "_.*"))
+
+tdf <- tdf |>
+  mutate(across(!CowNumber & !Diagnosis & !Parity & !Time, .fns = as.numeric),
+         Diagnosis = as.factor(Diagnosis),
+         Time = factor(Time, ordered = T, levels =  c("Prepartum", "Calving", "Diagnosis")),
+         Parity = as.factor(Parity),
+         CowNumber = as.factor(CowNumber))
+
+# Remove entries where none of the metabolites have a value (equivalent to having no sample)
+Cow_All <- tdf[rowSums(is.na(tdf[,5:269])) != ncol(tdf[,5:269]), ]
+#dim(Cow_All) #309, 269
+
+# Filter to only retain "calving" entries
+Cow_calving <- Cow_All |>
+  filter(Time == "Calving")
+
+# First 6 rows and 10 columns
+Cow_calving[1:6, 1:10]
+```
+
+Now we can look at the structure of the data using skim()
+
+```{r}
+skim(Cow_calving[1:20,])
+```
+
+There is significant skewness in the data, although this is expected for this kind of data, skewness can cause issues for analysis. To address this, I log transformed the data and opted for a log2, rather than the more common log10, to try to preserve more subtle biological signals that might be masked by a log10 transformation. Additionally, I used the autoscale() function to normalize the data by subtracting each observation by the mean and dividing it by the standard deviation. This is appropriate for this analysis because I am more interested in the *changes* in metabolites rather than amount or presence.
+
+```{r}
+# Log Transform
+Calving_log <- cbind(Cow_calving[1:4],
+                 log2(Cow_calving[5:ncol(Cow_All)]))
+
+# Scale
+Calving_scaled <- cbind(Calving_log[1:4],
+                    scale(Calving_log[5:ncol(Cow_All)]))
+
+# Check the structure again
+skim(Calving_scaled[1:20,])
+```
+
+Before proceeding with the analysis, I dummy-coded the data for model fitting down the line.\
+- Diagnosis: 0 is Con and 1 is Met\
+- Parity: 0 is primiparous and 1 is multiparous
+
+```{r}
+Coded_calv <- Calving_scaled |>
+  mutate(Diagnosis = as.numeric(Diagnosis)-1,
+         Parity = as.numeric(Parity)-1)
+
+# Print 
+Coded_calv[1:5,c(-1,-3)]
+```
+
+### Data Exploration
+
+2d plots where two or three variables are being visualized can be informative and straightforward ways to visualize and explore data, unfortunately, visualizing relationships within datasets becomes increasingly challenging with a rising number of variables (and thus dimensions), which is the case for this dataset. For data exploration, I will be using multi-dimensional scaling and other methods.
+
+#### Correlation
+
+Given that the data I am working with is metabolites, and that metabolites are interconnected, obtaining some degree of correlation between them during metabolomic analysis highly likely, if not unavoidable. To investigate the degree of correlation I (and by "I", I mean R) calculated a correlation matrix for all metabolites using Spearman correlation. I opted for Spearman, rather than the default choice, Pearson, because Spearman is able to capture monotonic relationship between variables, meaning it can detect whether two features increase or decrease together, regardless of the exact shape of their relationship while Pearson assumes linearity³. Finally, I produced a heat map to visualize the correlation matrix.
+
+```{r}
+# Compute the correlation matrix
+corr_matrix <- cor(Coded_calv[,c(-1,-3)], method = "spearman")
+
+# Plot without names 
+ggcorrplot(corr_matrix, tl.cex = 0) +
+  scale_fill_gradientn(values=c(1, .5, 0),
+                       colours = c("#E0006D", "white", "#E0006D"))
+```
+
+We can see above that there is correlation throughout the data, and some metabolites show strong correlation.
+
+#### PCA
+
+Now, let's plot this data using PCA. For the first plot, we'll see if cows seem to be grouped by "Diagnosis" or "Parity"
+
+```{r}
+# PCA
+pca_out <- prcomp(Coded_calv[,c(-1,-3)])
+
+pca_Diagnosis <- autoplot(pca_out, 
+         data = Calving_scaled, 
+         colour = 'Diagnosis',
+         shape = 'Diagnosis',
+         frame.colour = 'Diagnosis',
+         alpha = .7, 
+         frame = T) +
+  scale_color_manual(values = c(fav_colors[9], fav_colors[3])) +
+  scale_fill_manual(values = c(fav_colors[9], fav_colors[3]))
+
+
+pca_parity <- autoplot(pca_out, 
+         data = Calving_scaled, 
+         colour = 'Parity',
+         shape = 'Parity',
+         frame.colour = 'Parity',
+         alpha = .7, 
+         frame = T) +
+  scale_color_manual(values = c(fav_colors[9], fav_colors[3])) +
+  scale_fill_manual(values = c(fav_colors[9], fav_colors[3]))
+
+# Plot
+pca_Diagnosis
+pca_parity
+```
+
+The first principal component accounts for 10.21% of variation, while the second one accounts for 8.39%; Generally speaking, a PCA that achieves good separation is able to explain about 60-80% of variation in the first three components; The low variance explained in our plot is indicative that we do not have very well delineated groups and that there is overlap between cows with different characteristics. We can see that both diagnosis and parity exhibit significant overlap on the PCA plots. Notably, parity seems to show a slightly better separation between groups. Also notable is that there appear to be some outliers points, which may signify that some cows have a metabolic profile that is deviant even when compared to other cows in their group.
+
+#### Shenanigans
+
+Then, just for fun, I created a function that would iterate through the metabolites and create a plot for each metabolite with the fill corresponding to the either "Met" or "Con". Below you can find the first 4.
+
+```{r}
+# Create a boxplot for each metabolite 
+metabolite_names <- names(Calving_scaled[5:ncol(Calving_scaled)])
+
+# Create a function!
+create_boxplot <- function(metabolite) {
+  ggplot(Calving_scaled) +
+    geom_boxplot(aes(x = Time, y = get(metabolite), fill = Diagnosis), color = "black", lwd = .28) +
+    labs(title = paste0("Boxplot of ", metabolite),
+         x = "Time",
+         y = metabolite,
+         color = "Diagnosis")+
+    scale_fill_manual(values = c(fav_colors[3], fav_colors[9]))
+}
+
+# Apply the function to each metabolite and store the plots
+boxplots <- lapply(metabolite_names, create_boxplot)
+
+par(mfrow = c(2, 2))
+boxplots[[1]] 
+boxplots[[2]]
+boxplots[[3]]
+boxplots[[4]]
+par(mfrow = c(1, 1))
+```
+
+While the PCA plots visually suggest substantial overlap between Metritis and Control cows, I wanted to quantitatively test if these two groups could be considered different. To this end, I employed a PERMANOVA, the [explanation and tutorial](https://www.youtube.com/watch?v=1CFrNL3Fuqk&t=516s) available on Youtube by creator MADHURAJ P K⁴ were referenced for this step.
+
+PERMANOVA is suited for this data because it makes no assumptions about the underlying distribution of the data and it is robust towards multicollinearity. For PERMANOVA to be applicable though, there is one important assumption that I needed to test for: homogeneity of dispersion, or in other words, that the groups being compared have similar dispersion. To test this, I used the betasdisper() function before conducting the ANOVA.
+
+For the betaspider() function, I used "Canberra" distance, which is a weighted form of the Manhattan distance. This is based on the paper by [Dixon et al.](https://www.researchgate.net/publication/229019054_Weighted_distance_measures_for_metabolomic_data)⁶ in which the authors state that Canberra is one of the most repeatable measures for metabolomic data.
+
+#### PERMANOVA - Homogeneity of Multivariate Dispersion
+
+```{r}
+# Select the appropiate data
+data_matrix <- Calving_log[5:ncol(Calving_log)]
+
+# Distance
+distance = "canberra"
+
+# Check for Homogeneity of Multivariate Dispersion (Betaspider function)
+
+# Distance Matrix
+perm_dist <- vegdist(data_matrix, method = distance)
+
+# Assumptions
+dispersion <- betadisper(perm_dist, group = Calving_log$Diagnosis, type = "centroid")
+plot(dispersion, col = c(fav_colors[9], fav_colors[3]))
+
+anova(dispersion)
+```
+
+The p-value is 0.6103, much larger than 0.05, thus we reject fail to reject the null since there is not enough evidence to suggest that the dispersion for the groups is different. Now we can move on to the PERMANOVA using the adonis2() function
+
+#### PERMANOVA
+
+```{r}
+set.seed(575)
+Perma_result <- adonis2(perm_dist ~ as.factor(Calving_log$Diagnosis), 
+                        data = data_matrix, 
+                        permutations = 10000)
+
+Perma_result
+```
+
+The P-value for this test is 9.99e-05, this the data suggests that the Met and Con groups differ significantly.
+
+### Identifying Metabolites of importance
+
+Next, I aimed to identify which metabolites are important to differentiate between the two groups, to do this, I used three approaches:
+
+1\. Variable Importance in Projection (VIP) Scoring:
+
+First, I utilized Partial Least Squares Discriminant Analysis (PLS-DA) to identify metabolites with high VIP scores (\>1). These scores highlight variables contributing most to group separation by assessing their covariance with the response (Metritis vs Control). Additionally, this model was be used for outcome prediction (although it did not perform very well, as discussed later).
+
+2\. Elastic Net for Feature Selection:
+
+Next, I employed a penalized Generalized Linear Model (GLM). Similar to PLS-DA, LASSO will prioritize the most influential metabolites for model building, the retained variables can be extracted and used for subsequent steps.
+
+3\. Uni-variate T-test Confirmation:
+
+Finally, aiming to replicate the approach in the reference paper, I performed individual t-tests for each metabolite comparing Metritis and Control groups. This provides complementary uni-variate confirmation of significant differences identified through multivariate methods.
+
+#### PLS-DA
+
+PLS-DA is a supervised machine learning method, meaning it incorporates response variables (class labels) during model fitting⁶. This contrasts with unsupervised methods like PCA, which don't use class labels. Like PCA, PLS-DA reduces data dimensionality by identifying latent variables (components) that capture the most relevant information⁶. However, PLS-DA focuses retaining the mot covariance between response and predictor variables in it's principal components. PLS-DA does not require independence between predictor variables or assume a distribution for the data.⁶
+
+To fit the PLS-DA model, I followed [this tutorial](https://mda.tools/docs/plsda.html) put together by Sergey *Kucheryavskiy⁷* which used the plsda() function from the mdatools⁸ package which he authored. The code is shown below.
+
+```{r}
+# We need to use the "coded" data here and turn it into a matrix
+cod_tmp <- as.matrix(Coded_calv[,c(-1,-3)])
+resp <- Coded_calv$Diagnosis
+
+# Obrain a random index for splitting the data into training and validation
+set.seed(575)
+ind <- sample(x = 1:(nrow(cod_tmp)-2),
+              size = 80)
+
+# Save data
+train_matrix <- cod_tmp[ind,-1]
+train_response <- resp[ind] == 1 # Save the response variable at "true" if it is Met, or False is it is "Con"
+
+# Validation data
+val_matrix <- cod_tmp[-ind,-1]
+val_response <- resp[-ind] == 1 # Save the response variable at "true" if it is Met, or False is it is "Con"
+```
+
+```{r}
+# Calibrate model
+set.seed(575)
+m.all <- mdatools::plsda(train_matrix, 
+                train_response, 
+                4, cv = 1, 
+                classname = "Met", 
+                center = F)
+
+summary(m.all) 
+plot(m.all)
+par(mfrow = c(1, 2))
+plotRMSE(m.all)
+plotXYResiduals(m.all)
+```
+
+Below are the results of this first fit, for the calibration, the cumulative explained variance on the x-axis is 8.56 while it is 45.26 on Y. This model selected a total of 1 component. Now, it appears that our model is over-fitting as the calibrated model achieves an accuracy of \~81% but the cross validation resulted in an overall accuracy of 67.5%. While it is expected the data to do a bit better on the training set, but the difference seems too large here.
+
+| X   | X cumxpvar | Y cumexpvar | TP  | FP  | TN  | FN  | Spec. | Sens. | Accuracy |
+|:----|:-----------|:------------|:----|:----|:----|:----|:------|:------|:---------|
+| Cal | 8.56       | 45.26       | 30  | 10  | 35  | 5   | 0.778 | 0.857 | 0.812    |
+| Cv  | NA         | NA          | 24  | 15  | 30  | 11  | 0.667 | 0.686 | 0.675    |
+
+I decided to check if outliers were affecting the results. In the tutorial, Kucheryavskiy references the paper titled ["Detection of Outliers in Projection-Based Modeling"](https://pubs.acs.org/doi/10.1021/acs.analchem.9b04611) by Rodionova and Pomerantsev⁹. Their approach consists of identifying outliers and removing them from the calibration set, and then re-fitting the model, this is repeated until there are no outliers; then, the removed points are predicted using the re-fitted model, and if the residuals are not outliers, then add them back into the calibration set and create a final model. Below is this process.
+
+```{r}
+# Let's remove some outliers & repeat
+outliers <- which(categorize(m.all) == "extreme")
+
+# keep data for outliers on a separate matrix
+Xo <- train_matrix[outliers, , drop = FALSE]
+yo <- train_response[outliers]
+
+# remove data for outliers from training data
+X <- train_matrix[-outliers,]
+y <- train_response[-outliers] 
+
+# make a new model for outlier free data #here
+set.seed(575)
+m.all <-  mdatools::plsda(X, y, 4, cv = 1, classname = "Met", center = F)
+```
+
+Let's repeat the process until we have no outliers
+
+```{r}
+###
+# 1
+###
+
+# Let's remove some outliers & repeat
+outliers <- which(categorize(m.all) == "extreme")
+
+# keep data for outliers on a separate matrix
+Xo <- rbind(Xo, train_matrix[outliers, , drop = FALSE])
+yo <- append(yo, train_response[outliers])
+
+# remove data for outliers from training data
+X <- X[-outliers,]
+y <- y[-outliers] 
+
+# make a new model for outlier free data
+set.seed(575)
+m.all <-  mdatools::plsda(X, y, 4, cv = 1, classname = "Met", center = F)
+
+# Check for outliers again
+which(categorize(m.all) == "extreme")
+
+###
+# 2
+###
+
+# Let's remove some outliers & repeat
+outliers <- which(categorize(m.all) == "extreme")
+
+# keep data for outliers on a separate matrix
+Xo <- rbind(Xo, train_matrix[outliers, , drop = FALSE])
+yo <- append(yo, train_response[outliers])
+
+# remove data for outliers from training data
+X <- X[-outliers,]
+y <- y[-outliers] 
+
+# make a new model for outlier free data
+set.seed(575)
+m.all <-  mdatools::plsda(X, y, 4, cv = 1, classname = "Met", center = F)
+
+# Check for outliers again
+which(categorize(m.all) == "extreme")
+
+###
+# 3
+###
+
+# Let's remove some outliers & repeat
+outliers <- which(categorize(m.all) == "extreme")
+
+# keep data for outliers on a separate matrix
+Xo <- rbind(Xo, train_matrix[outliers, , drop = FALSE])
+yo <- append(yo, train_response[outliers])
+
+# remove data for outliers from training data
+X <- X[-outliers,]
+y <- y[-outliers] 
+
+# make a new model for outlier free data
+set.seed(575)
+m.all <-  mdatools::plsda(X, y, 4, cv = 1, classname = "Met", center = F)
+
+# Check for outliers again
+which(categorize(m.all) == "extreme")
+
+# We have removed all of the outliers 
+
+summary(m.all)
+```
+
+This model without outliers seems to be a better fit as it performs better on the "new" data. Next, let's predict the outliers with the model
+
+```{r}
+### Now predict them
+set.seed(575)
+res <- predict(m.all, Xo, yo)
+
+
+# Now plot the residuals for the predicted outliers 
+plotXYResiduals(m.all, res = list("cal" = m.all$res$cal, 
+                                  "out" = res),
+                show.labels = TRUE)
+
+out_ind <- c(-1,-3,-14)
+
+plotXYResiduals(m.all, 
+                res = list("cal" = m.all$res$cal, "out" = res),
+                show.labels = TRUE, labels = "indices")
+```
+
+Oh there's as issue here! Per the paper, the next step would be to add back the outliers whose predicted values do not end up being outliers themselves, unfortunately, after working on this for a while, I have not been able to actually figure out which ones those are, I have them labeled but it doesn't seem like the label actually corresponds to the index of the sample - I will look more into this since I do want to use this method for my own research, but for now there's just not enough time to figure it out. For the following prediction, I will use the model that does not include any outliers - which is acknowledge is not the recommended approach.
+
+#### PLS-DA Prediction
+
+Now we test the final model to predict the validation set and evaluate it's performance
+
+```{r}
+set.seed(575)
+m.pred <- predict(m.all, val_matrix, val_response)
+summary(m.pred)
+
+par(mfrow = c(2, 2))
+plotSpecificity(m.pred)
+plotSensitivity(m.pred)
+plotMisclassified(m.pred)
+plotPredictions(m.pred)
+par(mfrow = c(1, 1))
+
+plotPredictions(m.pred)
+```
+
+This PLS-DA achieved \~61% accuracy when put to test on the validation set, this is only slightly better than what we would expect from simply guessing "Met" with a probability equal to its proportion in the data (\~50%). In other words, the model struggled to accurately predict for cows it hadn't encountered during training. This suggests limited generalizability and does raise concerns about the model's effectiveness for classifying unseen Holstein cow samples.
+
+Despite the low predictive performance, some insights might still be gained from the analysis in the form of variable importance in projection (VIP) scores. As briefly discussed above, these scores highlight which metabolic features the model considers most influential in discriminating between "Met" and "Non-Met" states. However, given the model's low accuracy, it's important to interpret these VIP scores with caution as they may primarily reflect the specific characteristics of the training data (these Holstein cows) rather than providing reliable insights applicable to the broader Holstein population.
+
+#### PLS-DA VIP Scores
+
+Here, I extract the VIP scores for all input variables in the PSL-DA model (parity & all metabolites), then, I save the name and score of those exceeding a threshold of 1 (a common criterion for identifying important variables). This data frame will re-apear later in the project (see log fold change)
+
+```{r}
+vipscore <- as.data.frame(vipscores(m.all)) |>
+  rownames_to_column("Variable") |>
+  arrange(desc(Met))
+
+vipscore
+
+nrow(vipscore[vipscore$Met > 1,])
+# There are 85 metabolites with a VIP score greater than 1, these will be saved as a dataframe called VIPdf
+
+VIPdf <- vipscore[vipscore$Met > 1,]
+```
+
+#### GLM with Elastic Net
+
+To fit a GLM that is penalized with elastic net I used the nestedcv¹⁰ package which utilizes *glmnet* functions but also includes the (fantastic) nestedcv.train() function which makes it possible to fit a model using *nested* cross validation, for this analysis:
+
+-   I allowed the function to pick the best lambda.
+
+-   I used the filterFUN option to allow for filter the features based on their t-test values, this was supposed to facilitated model fitting and aligns with the subsequent uni variate t-test analysis.
+
+-   Used 10 outer and inner folds; this works as follows:
+
+    -   Outer Loop: The whole dataset is divided into 10 segments, each taking a turn as a holdout set to assess model performance on "new" data, while the remaining 9 segments are used in the inner loop to train the model
+
+    -   Inner Loop: Within each outer fold's training stage, the 9 segments are turned into 10 (10-fold inner loop) and used for tuning the model's hyperparameters, for this analysis, this is specifically the elastic net penalty lambda, which determines how harshly the penalization is. Alpha is set to 1 and does not get tuned.
+
+    -   The overall best performing is stored under "final_fit" inside the object
+
+-   Finally, to avoid overfitting and removing features that might nor be contributing strongly to the model's performance, I set the elastic net penalty alpha equal to 1, which corresponds to LASSO penalty, as opposed to 0 which corresponds to ridge regression; The former removes features, while the latter shrinks coefficients without removing features altogether.
+
+    The final model retained 69 predictors which are shown below. However, after multiple iterations, I wasn't able to obtain a balanced accuracy higher than 63% - whlile lower than I was hoping, that the accuracy is consistent suggests that this is indeed the best this approach can do with the data and might just be a reflection on the lack of significant separation between groups.
+
+```{r}
+# We need to use the "coded" data here and turn it into a matrix
+cod_tmp <- Coded_calv[,5:ncol(Coded_calv)]
+resp <- Calving_scaled$Diagnosis
+
+# A holdout/validation set is not required for nested cross validation
+tg <- expand.grid(lambda = exp(seq(log(2e-3), log(1e0), length.out = 6)),
+                  alpha = 1)
+
+set.seed(575)
+lasso_fit <- nestcv.train(y = resp, 
+                          x = cod_tmp, 
+                          filterFUN = "ttest_filter",
+                          method = "glmnet",
+                          n_outer_folds = 10,
+                          n_inner_folds = 10,
+                          tuneGrid = tg)
+```
+
+```{r}
+summary(lasso_fit)
+lasso_vars <- lasso_fit$final_vars
+lasso_vars
+```
+
+#### T-test
+
+As the final step in my analysis pipeline, I performed an univariate t-test; that is, performed a t-test comparing one metabolite at a time in relation to the Diagnosis group. All tests followed the formula *Diagnosis* \~ *Metabolite*. The null hypothesis for each of this t-test is that there's no significant difference in the abundance of a given metabolite between the two groups. I selected a cutoff of 0.05; while I considered a stricted cutoff to minimize the likelihood of false positives, the goal of this analysis is to discovering potentially important metabolites and metabolic pathways and a stricter p-value might lead to the exclusion of real and important but subtle differences between groups.
+
+As discussed in lecture (which was very helpful!) the obtained p-values are a measure of the probability of observing the data (or more extreme results) if the null hypothesis (no difference) were true.
+
+-   A p-value below the threshold indicates that the chance of observing this differences due to chance is fairly small, and thus leads to the rejection of the null; the interpretation of this conclusion is that the differences are likely real.
+
+-   On the other hand, a value above the 0.05 threshold indicates a higher chance of obtaining these values by chance and leads to the failure to reject the null; This means we don't have enough evidence to conclude a difference exists.
+
+After the t-test, the metabolites with p-values smaller that 0.05 were retained in a variable called "sig_metabolites"
+
+```{r}
+# For t-test, remove CowNumber and Time
+t_data <- Calving_log |>
+  dplyr::select(c(-CowNumber, -Time)) |>
+  dplyr::mutate(Diagnosis = as.numeric(Diagnosis) - 1,
+                Parity = as.numeric(Parity) - 1)
+
+
+# Do the t-test for each metabolite
+metabolite_names <- names(Calving_log[4:ncol(Calving_log)])
+t.tests <- lapply(metabolite_names, 
+                  function(x) t.test(reformulate("Diagnosis", x), 
+                                     data = t_data))
+
+# Create a vector containing all the p-values
+p_list <- c()
+for (i in 1:length(t.tests)){
+  p_list <- append(p_list,(t.tests[[i]]$p.value))
+}
+
+# Get index for p-values smaller than 0.01 and obtain the entries
+sig_metabolites <- metabolite_names[which(p_list < 0.05)]
+```
+
+#### Putting all the analyses together
+
+Now, I retained the metabolites that were retained by the PLS-DA fit, the LASSO fit *and* had a p-value smaller than 0.05. This approach increased my confidence that these features are important for group separation
+
+```{r}
+# Save the metabolites names for metabolites that had a high VIP score, were retained by LASSO fit and had a p-value smaller than 0.05
+
+validated_metabolites <- intersect(sig_metabolites, VIPdf$Variable)
+validated_metabolites <- intersect(validated_metabolites, lasso_vars)
+
+# Create a dataframe with colMeans for cows in the Met group, and a separate one with colMeans for Con. Then put them together and add the names. 
+met_df <- Calving_log |>
+  filter(Diagnosis == "Met") |>
+  dplyr::select(c(-Parity, -Time, - Diagnosis, -CowNumber)) |>
+  colMeans()
+
+con_df <- Calving_log |>
+  filter(Diagnosis == "Con") |>
+  dplyr::select(c(-Parity, -Time, - Diagnosis, -CowNumber)) |>
+  colMeans()
+
+tmp_df <- tibble(names = names(met_df), met = met_df, con = con_df)
+
+
+# Now for plotting the log change modify the columns so that they can be read by ggplot
+
+change_data <- tmp_df |>
+  filter(names %in% validated_metabolites) |>
+  mutate(met = as.numeric(met),
+         con = as.numeric(con),
+         change = con - met)
+```
+
+## Log Fold Change and Conclusion
+
+This final plot summarizes the metabolites significantly altered between the Met and Control groups, identified by all three employed statistical tests (PLS-DA, GLM-LASSO, and t-tests). It presents the log2 fold change, which reflects the magnitude of change in metabolite levels between the groups on a logarithmic scale. Positive values indicate higher abundance in the Met group, while negative values mean lower. For example, a log2 fold change of 0.5 signifies that the metabolite in Met is 1.5 times as abundant compared to Control, and vice versa for -0.5.
+
+Metabolites with an absolute log2 fold increase value of 0.5 or higher are shown below (n=12).
+
+\[Thanks to user [i.sudbery](https://www.biostars.org/u/16790/), who teaches bioinformatics at the University of Sheffieldat for providing a great explanation for this process on the [biostar](https://www.biostars.org/p/342756/#:~:text=A%20fold%20change%20describes%20the,i.e.%20log2(condition1%2Fcondition2)) forum! \]
+
+```{r}
+ggplot() +
+  geom_bar(aes(x = names, 
+               y = change, 
+               fill = change), 
+           stat = "identity",
+           color = fav_colors[3],
+           lwd = .1,
+           data = change_data) +
+  labs(title = "Metritis vs Control Log2 change in metabolite abundance",
+       subtitle = "Log2 change observed in Met group compared to Con group") + 
+  xlab(label = "Metabolite Name") +
+  ylab(label = "Log2 fold change") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  scale_fill_gradientn(values=c(1, .5, 0), colours = c(fav_colors[3], "white", fav_colors[2]))
+
+change_data |> 
+  filter(abs(change) > 0.5) |>
+  mutate(metabolite_name = str_replace(names, "M_", "")) |>
+  select(metabolite_name, change) |>
+  arrange(desc(change))
+```
+
+The appropriate next step for this analysis would be to put this information in a biologically relevant context by performing a functional enrichment analysis, this would translate the metabolite data into potential metabolic pathways that might be relevant for metritis susceptibility at time of calving for the cows included in this study.
+
+As discussed before, the consistent lower performance of this dataset on "outside" data is of concern here though, and while might lead to biological insights, it is important to proceed with caution to avoid incorrectly generalizing to the entire population. We can conclude that changes between Met and Con were present, but I would find it troubling to assume that these changes represent a "Metritis" profile. More data and further analysis would be required to make these findings more generalizable.
+
+# References
+
+1.  Casaro, S. et al. Blood metabolomics and impacted cellular mechanisms during transition into lactation in dairy cows that develop metritis. J. Dairy Sci. 106, 8098--8109 (2023).
+2.  Metritis in Production Animals - Reproductive System. MSD Veterinary Manual https://www.msdvetmanual.com/reproductive-system/uterine-diseases-in-production-animals/metritis-in-production-animals.
+3.  <https://www.statstutor.ac.uk/resources/uploaded/spearmans.pdf>
+4.  PERMANOVA in R \| Explanation and Implementation. (2023).
+5.  Dixon, P., Wu, L., Widrlechner, M. & Wurtele, E. Weighted distance measures for metabolomic data. (2009).
+6.  Ruiz-Perez, D., Guan, H., Madhivanan, P., Mathee, K. & Narasimhan, G. So you think you can PLS-DA? BMC Bioinformatics 21, 2 (2020).
+7.  Kucheryavskiy, S. PLS Discriminant Analysis \| Getting started with mdatools for R.
+8.  Kucheryavskiy, S. mdatools -- R package for chemometrics. Chemom. Intell. Lab. Syst. 198, 103937 (2020).
+9.  Rodionova, O. Ye. & Pomerantsev, A. L. Detection of Outliers in Projection-Based Modeling. Anal. Chem. 92, 2656--2664 (2020).
+10. Lewis, M., Spiliopoulou, A. & Goldmann, K. nestedcv: Nested Cross-Validation with 'glmnet' and 'caret'. (2022).
